@@ -81,7 +81,7 @@ FIELDS = ["Deliverability", "Notes/Issues", "Send_Recommendation", "Syntax Valid
 
 def validate_syntax(email):
     try:
-        validate_email(email, check_deliverability=False)  # syntax only; we do DNS ourselves
+        validate_email(email, check_deliverability=False)
         return True
     except EmailNotValidError:
         return False
@@ -93,7 +93,7 @@ def dns_lookup(domain):
     try:
         ans = RESOLVER.resolve(domain, "MX")
         recs = sorted((r.preference, str(r.exchange).rstrip(".")) for r in ans)
-        if len(recs) == 1 and recs[0][1] == "":  # null MX
+        if len(recs) == 1 and recs[0][1] == "":
             return "no_mail", []
         return "ok", [h for _, h in recs]
     except dns.resolver.NXDOMAIN:
@@ -134,7 +134,7 @@ BLOCK_WORDS = ("block", "spam", "reputation", "blacklist", "spamhaus", "rbl", "l
 
 
 def classify_reply(code, msg):
-    """accepted | rejected (mailbox truly missing) | temp | blocked (our check was refused)"""
+    """accepted | rejected | temp | blocked"""
     low = msg.lower()
     if code in (250, 251):
         return "accepted"
@@ -185,8 +185,84 @@ def port25_works():
         return False
 
 
+# ==================== SINGLE EMAIL QUICK CHECK ====================
+
+def quick_verify(email, cfg=None):
+    """
+    Convenience wrapper: validate ONE email address end-to-end and
+    return a human-readable verdict string. Reuses the same DNS + SMTP
+    logic as the batch validator (no duplicated code).
+    """
+    email = (email or "").strip().lower()
+    if not email:
+        return "Invalid Syntax (empty input)"
+
+    if cfg is None:
+        cfg = {
+            "skip_smtp": not port25_works(),
+            "mail_from": "verify@example.com",
+            "helo": socket.getfqdn(),
+            "timeout": 12,
+            "retry_wait": 10,
+            "delay": 0,
+        }
+
+    if not validate_syntax(email):
+        return "Invalid Syntax"
+
+    local, _, domain = email.rpartition("@")
+    if not domain:
+        return "Invalid Syntax"
+
+    dstat, hosts = dns_lookup(domain)
+    if dstat == "nxdomain":
+        return "Domain does not exist (NXDOMAIN)"
+    if dstat == "no_mail":
+        return "Domain has no active mail servers (no MX / null MX)"
+    if dstat != "ok":
+        return "DNS lookup failed - retry later"
+
+    if is_disposable(domain):
+        return "Rejected: Disposable / throwaway domain"
+
+    if cfg["skip_smtp"]:
+        return "Syntax + domain OK (SMTP check skipped - port 25 blocked)"
+
+    state, code = smtp_probe(hosts, email, cfg["helo"], cfg["mail_from"], cfg["timeout"])
+
+    if state == "temp":
+        time.sleep(cfg.get("retry_wait", 10))
+        state, code = smtp_probe(hosts, email, cfg["helo"], cfg["mail_from"], cfg["timeout"])
+
+    if state == "accepted":
+        return "Valid Email (Deliverable)"
+    if state == "rejected":
+        return f"Failed Verification: mailbox rejected (SMTP {code})"
+    if state == "blocked":
+        return f"Unconfirmed: server refused our check (SMTP {code})"
+    return "Connection or handshake error: mail server unreachable on port 25"
+
+
+def quick_verify_row(email, cfg=None):
+    """Same as quick_verify but returns a full result dict (same shape as batch rows)."""
+    email = (email or "").strip().lower()
+    if not email:
+        return {"Email": email, "Deliverability": "Not Deliverable",
+                "Notes/Issues": "Empty input", "Send_Recommendation": "Do not send"}
+
+    if cfg is None:
+        cfg = {"skip_smtp": not port25_works(), "mail_from": "verify@example.com",
+               "helo": socket.getfqdn(), "timeout": 12, "retry_wait": 10,
+               "delay": 0, "workers": 1}
+
+    if not validate_syntax(email):
+        return to_row(blank(email, syntax=False))
+
+    domain = email.rsplit("@", 1)[1].lower()
+    return safe_check_domain(domain, [email], cfg)[0]
+
+
 # ==================== VERDICT ====================
-# "Deliverable" is only given when the mail server itself confirmed the mailbox.
 
 def get_status(r):
     if not r["syntax"]:
@@ -246,8 +322,6 @@ def blank(email, **kw):
 
 
 # ==================== PER-DOMAIN WORKER ====================
-# DNS, SPF and catch-all are checked ONCE per domain, domains run in parallel,
-# and emails on the same domain run one after another (polite to the mail server).
 
 def check_domain(domain, emails, cfg):
     dstat, hosts = dns_lookup(domain)
@@ -271,7 +345,7 @@ def check_domain(domain, emails, cfg):
                   mx=hosts[0] if hosts else "")
         if do_smtp:
             state, code = smtp_probe(hosts, e, cfg["helo"], cfg["mail_from"], cfg["timeout"])
-            if state == "temp":  # greylisting: wait and try once more
+            if state == "temp":
                 time.sleep(cfg["retry_wait"])
                 state, code = smtp_probe(hosts, e, cfg["helo"], cfg["mail_from"], cfg["timeout"])
             r["smtp"], r["code"] = state, code or ""
@@ -283,7 +357,7 @@ def check_domain(domain, emails, cfg):
 def safe_check_domain(domain, emails, cfg):
     try:
         return check_domain(domain, emails, cfg)
-    except Exception as ex:  # one bad domain must never crash the whole run
+    except Exception as ex:
         out = []
         for e in emails:
             row = to_row(blank(e, dns="dns_error"))
@@ -346,7 +420,7 @@ def process_csv_with_live_output(file, email_column, cfg):
     emails = []
     for cell in df[email_column].dropna():
         emails.extend(e.lower() for e in split_cell(cell))
-    emails = list(dict.fromkeys(emails))  # unique, original order kept
+    emails = list(dict.fromkeys(emails))
 
     start = time.time()
     progress_bar = st.progress(0)
@@ -365,13 +439,12 @@ def process_csv_with_live_output(file, email_column, cfg):
             f"Unknown: **{c['Unknown']}** | Not Deliverable: **{c['Not Deliverable']}**  \n"
             f"Speed: **{speed:.1f}** emails/sec | ETA: **{format_time(eta)}**")
         progress_bar.progress(min(done / total, 1.0))
-        if tick["n"] % 5 == 0 or done == total:  # redraw table every 5 updates, not every row
+        if tick["n"] % 5 == 0 or done == total:
             live_table.dataframe(style_table(pd.DataFrame(rows)), use_container_width=True, height=500)
 
     final = validate_batch(emails, cfg, on_progress)
     val = {r["Email"]: r for r in final}
 
-    # Merge back into the original file (Primary_* and Secondary_* columns, as before)
     primaries, secondaries = [], []
     for cell in df[email_column]:
         parts = [p.lower() for p in split_cell(cell)] if not pd.isna(cell) else []
@@ -404,8 +477,12 @@ def main():
                    "server with port 25 open to get real mailbox checks.")
 
     with st.expander("Settings", expanded=can_smtp):
-        mail_from = st.text_input("Your real sending address (MAIL FROM)", placeholder="you@yourdomain.com",
-                                  help="Use an address on your own domain. Fake senders get rejected.")
+        mail_from = st.text_input(
+            "Your real sending address (MAIL FROM)",
+            placeholder="you@yourdomain.com",
+            key="mail_from_input",
+            help="Use an address on your own domain. Fake senders get rejected."
+        )
         helo = st.text_input("Your server hostname (HELO)", value=socket.getfqdn())
         workers = st.slider("Domains checked in parallel", 1, 20, 8)
         delay = st.slider("Seconds between checks on the same domain", 0.0, 5.0, 1.0, 0.5)
@@ -441,6 +518,39 @@ def main():
                            file_name="validated_results.csv", mime="text/csv", type="primary")
         st.download_button("Download SAFE-TO-SEND list only (Deliverable)", data=st.session_state.safe_csv,
                            file_name="safe_to_send.csv", mime="text/csv")
+
+    # ==================== SINGLE EMAIL QUICK CHECK ====================
+    st.markdown("---")
+    st.subheader("Quick check (single email)")
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        single_email = st.text_input("Email address", placeholder="someone@example.com",
+                                     key="single_email_input")
+    with col2:
+        st.write("")
+        st.write("")
+        run_single = st.button("Verify", key="single_verify_btn", type="primary")
+
+    if run_single and single_email:
+        with st.spinner("Verifying..."):
+            cfg_single = {
+                "skip_smtp": not can_smtp,
+                "mail_from": st.session_state.get("mail_from_input", "") or "verify@example.com",
+                "helo": helo,
+                "workers": 1,
+                "delay": 0,
+                "timeout": 12,
+                "retry_wait": 10,
+            }
+            verdict = quick_verify(single_email, cfg_single)
+            row = quick_verify_row(single_email, cfg_single)
+        if verdict.startswith("Valid"):
+            st.success(verdict)
+        elif verdict.startswith("Rejected") or verdict.startswith("Failed"):
+            st.error(verdict)
+        else:
+            st.warning(verdict)
+        st.dataframe(style_table(pd.DataFrame([row])), use_container_width=True)
 
 
 DISPOSABLE_DOMAINS = fetch_disposable_domains()
